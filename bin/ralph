@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+PKG_DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+exec "$PKG_DIR/node_modules/.bin/tsx" "$PKG_DIR/ralph.ts" "$@"
