@@ -190,6 +190,45 @@ function die(msg: string): never {
 }
 
 // ---------------------------------------------------------------------------
+// Locate the ralph binary on disk (for embedding into pm2 ecosystems)
+// ---------------------------------------------------------------------------
+//
+// We absolutely cannot hardcode `/usr/local/bin/ralph` in the auto-generated
+// `ralph.config.cjs`: ralph is normally installed via `npm install -g` /
+// `npm link`, which puts the binary under whatever node bin dir is on PATH
+// (e.g. `~/.nvm/versions/node/vXX.YY.Z/bin/ralph`). Resolve it dynamically so
+// the generated pm2 config works on any host.
+function resolveRalphBinary(): string {
+  // 1. Prefer `which ralph` because that's the user-facing entrypoint that's
+  //    on PATH (typically a symlink to the package's bin/ralph shim).
+  try {
+    const r = spawnSync("which", ["ralph"], { encoding: "utf8" });
+    if (r.status === 0) {
+      const p = (r.stdout ?? "").trim();
+      if (p && existsSync(p)) return p;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 2. Fall back to deriving from this script's own location: argv[1] is
+  //    `<package>/ralph.ts` (because the bash shim execs `tsx ralph.ts`),
+  //    so the shim itself lives at `<package>/bin/ralph`.
+  try {
+    const here = process.argv[1] ? resolve(process.argv[1]) : "";
+    if (here) {
+      const candidate = resolve(dirname(here), "bin", "ralph");
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // 3. Last resort: rely on PATH lookup at pm2 spawn time.
+  return "ralph";
+}
+
+// ---------------------------------------------------------------------------
 // API key (env or doppler fallback)
 // ---------------------------------------------------------------------------
 
@@ -235,8 +274,9 @@ function resolveApiKey(): string {
   }
   lines.push("Fix one of:");
   lines.push("  - export CURSOR_API_KEY=<key>           (bypass doppler)");
-  lines.push("  - doppler login --no-check && doppler setup   (configure this box)");
-  lines.push("  - DOPPLER_TOKEN=dp.st.xxx ralph GOAL.md       (use a service token inline)");
+  lines.push("  - doppler login --no-check && doppler setup            (configure this box)");
+  lines.push("  - export DOPPLER_PROJECT=<proj> DOPPLER_CONFIG=<cfg>    (set scope inline)");
+  lines.push("  - DOPPLER_TOKEN=dp.st.xxx ralph GOAL.md                (use a service token inline)");
   die(lines.join("\n"));
 }
 
@@ -1440,7 +1480,7 @@ Once you've written it:
     ralph stop <name>     # graceful stop
 `;
 
-function renderRalphConfigCjs(name: string, absDir: string): string {
+function renderRalphConfigCjs(name: string, absDir: string, ralphBin: string): string {
   const pm2Name = pm2NameFor(name);
   return `/**
  * pm2 ecosystem for ralph project "${name}".
@@ -1451,11 +1491,30 @@ function renderRalphConfigCjs(name: string, absDir: string): string {
  * Stop:     ralph stop ${name}
  */
 
+// Forward any of these env vars from the shell that runs \`ralph run\` into
+// the pm2-managed child. CURSOR_API_KEY skips doppler entirely; DOPPLER_*
+// give the in-loop \`doppler secrets get\` enough scope to actually resolve
+// CURSOR_API_KEY on a fresh box. Empty/undefined values are stripped so they
+// don't shadow whatever pm2 / the OS already provides.
+const FORWARD_ENV = [
+  "PATH",
+  "HOME",
+  "CURSOR_API_KEY",
+  "DOPPLER_TOKEN",
+  "DOPPLER_PROJECT",
+  "DOPPLER_CONFIG",
+];
+const env = Object.fromEntries(
+  FORWARD_ENV
+    .map((k) => [k, process.env[k]])
+    .filter(([, v]) => typeof v === "string" && v.length > 0)
+);
+
 module.exports = {
   apps: [
     {
       name: ${JSON.stringify(pm2Name)},
-      script: "/usr/local/bin/ralph",
+      script: ${JSON.stringify(ralphBin)},
       args: ["loop", "GOAL.md"],
       cwd: ${JSON.stringify(absDir)},
       interpreter: "bash",
@@ -1468,12 +1527,7 @@ module.exports = {
       error_file: ${JSON.stringify(join(absDir, ".ralph", "pm2.err.log"))},
       merge_logs: true,
       time: true,
-      env: {
-        PATH: process.env.PATH,
-        HOME: process.env.HOME,
-        // CURSOR_API_KEY: "key_...",     // pin if you don't want to rely on doppler
-        // DOPPLER_TOKEN: "dp.st.xxx",    // or a doppler service token
-      },
+      env,
     },
   ],
 };
@@ -1520,8 +1574,9 @@ Then:
     ensureDir(absDir);
   }
 
+  const ralphBin = resolveRalphBinary();
   atomicWrite(join(absDir, "GOAL.md"), GOAL_MD_TEMPLATE);
-  atomicWrite(join(absDir, "ralph.config.cjs"), renderRalphConfigCjs(name, absDir));
+  atomicWrite(join(absDir, "ralph.config.cjs"), renderRalphConfigCjs(name, absDir, ralphBin));
   atomicWrite(join(absDir, ".gitignore"), CONTROL_PLANE_GITIGNORE_INIT);
 
   registerProject(name, absDir);
@@ -1555,9 +1610,25 @@ async function cmdRun(rest: string[]): Promise<void> {
     return;
   }
   if (existing) {
-    logInfo(`${pm2Name} exists but is ${existing.pm2_env.status}; restarting`);
-    const r = runPm2(["restart", pm2Name, "--update-env"]);
-    if (r.status !== 0) die(`pm2 restart failed:\n${r.stderr || r.stdout}`);
+    // Anything other than "online" or "stopped" (errored, waiting restart,
+    // launching, one-launch-status) tends to make `pm2 restart <name>` flaky -
+    // we've seen it fail with "Process 0 not found" when pm2 is mid-respawn.
+    // Delete and start fresh from cfg in that case so we always pick up the
+    // latest env / script path too.
+    const status = existing.pm2_env.status;
+    if (status === "stopped") {
+      logInfo(`${pm2Name} is stopped; starting`);
+      const r = runPm2(["restart", pm2Name, "--update-env"]);
+      if (r.status !== 0) die(`pm2 restart failed:\n${r.stderr || r.stdout}`);
+    } else {
+      logInfo(`${pm2Name} is in state "${status}"; deleting and re-starting from ${cfg}`);
+      const del = runPm2(["delete", pm2Name]);
+      if (del.status !== 0) {
+        logWarn(`pm2 delete returned ${del.status}: ${del.stderr || del.stdout}`);
+      }
+      const r = runPm2(["start", cfg]);
+      if (r.status !== 0) die(`pm2 start failed:\n${r.stderr || r.stdout}`);
+    }
   } else {
     logInfo(`starting ${pm2Name} from ${cfg}`);
     const r = runPm2(["start", cfg]);
